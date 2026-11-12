@@ -32,9 +32,25 @@ jobs:
           tar xzf sc.tar.gz
           BIN=$(find . -path ./.github -prune -o -type f -name 'subs-check' -print | head -1)
           chmod +x "$BIN"
-          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "BIN=$BIN" >> "$GENV"
 
-      - name: Run one round
+      - name: Download mihomo core
+        run: |
+          set -e
+          REL=$(curl -s -H "Authorization: Bearer $GH_TOK" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
+          VER=$(echo "$REL" | jq -r '.tag_name // empty')
+          ASSET=$(echo "$REL" | jq -r '.assets[]? | select(.name|test("linux-amd64-v3\\.gz$")) | .browser_download_url' | head -1)
+          if [ -z "$ASSET" ] || [ "$ASSET" = "null" ]; then
+            VER=${VER:-v1.19.8}
+            ASSET="https://github.com/MetaCubeX/mihomo/releases/download/${VER}/mihomo-linux-amd64-v3.gz"
+          fi
+          echo "mihomo version=$VER asset=$ASSET"
+          curl -sSL --retry 3 -o mihomo.gz "$ASSET"
+          gunzip -c mihomo.gz > mihomo
+          chmod +x mihomo
+          echo "MIHOMO_BIN=$PWD/mihomo" >> "$GENV"
+
+      - name: Run subs-check one round
         run: |
           "$BIN" -f config.yaml > sc.log 2>&1 &
           PID=$!; DONE=0
@@ -49,10 +65,10 @@ jobs:
           grep -iE "level=FATAL|level=ERROR" sc.log | tail -8 || true
           ls -la output/ 2>/dev/null || true
 
-      - name: Connectivity test (TCP + HTTP)
+      - name: Connectivity test (TCP + HTTP via mihomo)
         run: |
           python3 - <<'PY'
-          import glob, json, re, sys, subprocess, os, urllib.request, urllib.parse, concurrent.futures as cf
+          import glob, json, re, sys, subprocess, os, urllib.request, urllib.parse, concurrent.futures as cf, time
           
           def load_yaml(path):
               try:
@@ -87,6 +103,10 @@ jobs:
                   proxies += d.get("proxies") or []
               print(f"loaded {len(proxies)} proxies from {len(files)} files")
               
+              mihomo_bin = os.environ.get("MIHOMO_BIN")
+              if not mihomo_bin or not os.path.exists(mihomo_bin):
+                  print(f"MIHOMO_BIN not set or missing: {mihomo_bin}"); sys.exit(1)
+              
               # start a temporary mihomo with all proxies
               cfg = {
                   "mixed-port": 17890,
@@ -100,7 +120,6 @@ jobs:
               with tempfile.TemporaryDirectory() as td:
                   cfg_path = os.path.join(td, "cfg.yaml")
                   with open(cfg_path, "w") as f: _json.dump(cfg, f)
-                  mihomo_bin = os.environ.get("MIHOMO_BIN", "mihomo")
                   proc = subprocess.Popen([mihomo_bin, "-d", td, "-f", cfg_path],
                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                   time.sleep(3)
@@ -137,10 +156,7 @@ jobs:
                               with open(f, "w") as fh:
                                   yaml.dump(d, fh, allow_unicode=True, sort_keys=False)
                       print(f"filtered: {len(proxies)} -> {len(alive_proxies)}")
-                  finally:
-                      proc.terminate()
-                      proc.wait(timeout=5)
-          main()
+              main()
           PY
 
       - name: Enrich + grade -> nodes.json

@@ -26,19 +26,7 @@ listen-port: ":8199"
 rename-node: true
 node-prefix: ""
 
-# 按 IP 归属地重命名后，App 端按名字里的国家/地区分组（HK/TW/SG/US/JP）
-# 这里不按地区过滤，全保留，让 App 端分流
-# 按地区过滤：只保留亚洲节点做测速（测速最费流量，欧美节点对看港台频道没用）
-# 过滤发生在"测活+按IP归属地重命名"之后，所以这里匹配的是 IP 真实归属地标签
-filter:
-  - "HK|香港|Hong Kong"
-  - "TW|台湾|Taiwan"
-  - "MO|澳门|Macau"
-  - "SG|新加坡|Singapore"
-  - "JP|日本|Japan"
-  - "KR|韩国|Korea"
-  - "MY|马来西亚|Malaysia"
-  - "US|美国|America"
+# 不按地区过滤：3D 地球要覆盖所有国家
 
 # 流媒体检测：注意 subs-check 只检测 iprisk/tiktok/youtube/netflix/disney/openai/gemini/claude/spotify
 # 它【不检测 TVB/ViuTV】——港台频道靠 rename-node 出来的 HK/TW 地区标签做地理分流
@@ -57,10 +45,8 @@ output-dir: "output"
 enable-web-ui: false
 sub-store-port: ""
 
-# 保存方法：secret Gist（token 由 Actions 运行时注入，不入库）
-save-method: gist
-github-gist-id: ""
-github-token: ""
+# 保存方式：本地 output/（由 workflow 提交回仓库，无需任何 secret）
+save-method: local
 
 sub-urls:
   - "https://raw.githubusercontent.com/firefoxmmx2/v2rayshare_subcription/main/subscription/clash_sub.yaml"

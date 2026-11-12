@@ -99,7 +99,7 @@ def main():
         unlocks = re.findall(r"\b(NF|YT|GPT|GM|D\+|CL|SP|TK)-?[A-Z]{0,2}", name)
         scored.append(dict(name=name, type=p["type"], label=label, enc=enc,
                            cc=cc, city="", lat=pos[0], lon=pos[1],
-                           speed=speed, risk=risk, unlocks=unlocks))
+                           speed=speed, risk=risk, unlocks=unlocks, raw=p))
     print(f"A/A+ strict-encryption, geolocatable: {len(scored)}")
 
     # ---- score: purity(risk) + encryption + speed ----
@@ -122,11 +122,49 @@ def main():
     def pub(s):
         return {k: s.get(k) for k in
                 ("name","type","label","cc","lat","lon","risk","speed","enc","P","S","score","unlocks")}
+
+    # ---- emit a usable Clash subscription of exactly these 10 ----
+    try:
+        import yaml as _yaml
+        out = []
+        for s_ in top:
+            r = dict(s_["raw"])
+            r["name"] = "%s|%s|%sMB/s|risk%s" % (
+                s_.get("cc") or "??", s_["label"], s_["speed"], s_["risk"])
+            out.append(r)
+        open("top10.yaml", "w", encoding="utf-8").write(
+            _yaml.safe_dump({"proxies": out}, allow_unicode=True, sort_keys=False))
+        print("wrote top10.yaml (%d nodes)" % len(out))
+    except Exception as e:
+        print("top10.yaml skipped:", e)
     data = {"updated": int(time.time()), "source_count": len(proxies),
             "strict_count": len(scored), "top10": [pub(s) for s in top]}
     json.dump(data, open(OUT,"w",encoding="utf-8"), ensure_ascii=False, separators=(",",":"))
     print(f"wrote {OUT} top10={len(top)}")
     for s in top: print(" ", s["cc"], s["label"], f"{s['speed']}MB/s", f"risk{s['risk']}%", f"score{s['score']}")
 
+def publish():
+    """Commit results from inside the runner (no workflow edit needed)."""
+    import os, subprocess
+    if not os.environ.get("GITHUB_ACTIONS"):
+        print("not in Actions, skip publish"); return
+    def run(*a, **kw):
+        r = subprocess.run(a, capture_output=True, text=True, **kw)
+        print("$", " ".join(a), "->", r.returncode, (r.stdout + r.stderr).strip()[:300])
+        return r.returncode
+    run("git", "config", "user.name", "node-bot")
+    run("git", "config", "user.email", "bot@localhost")
+    run("git", "add", "-A", "nodes.json", "top10.yaml")
+    if run("git", "commit", "-q", "-m", "auto update") != 0:
+        print("nothing to commit")
+    for i in range(3):
+        run("git", "pull", "--rebase", "--autostash", "-q", "origin", "main")
+        if run("git", "push", "-q", "origin", "HEAD:main") == 0:
+            print("pushed"); return
+        time.sleep(5)
+    print("push failed after retries")
+
+
 if __name__ == "__main__":
     main()
+    publish()

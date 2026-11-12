@@ -32,7 +32,7 @@ jobs:
           tar xzf sc.tar.gz
           BIN=$(find . -path ./.github -prune -o -type f -name 'subs-check' -print | head -1)
           chmod +x "$BIN"
-          echo "BIN=$BIN" >> "$GENV"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
 
       - name: Download mihomo core
         run: |
@@ -48,7 +48,7 @@ jobs:
           curl -sSL --retry 3 -o mihomo.gz "$ASSET"
           gunzip -c mihomo.gz > mihomo
           chmod +x mihomo
-          echo "MIHOMO_BIN=$PWD/mihomo" >> "$GENV"
+          echo "MIHOMO_BIN=$PWD/mihomo" >> "$GITHUB_ENV"
 
       - name: Run subs-check one round
         run: |

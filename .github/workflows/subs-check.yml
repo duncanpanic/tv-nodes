@@ -49,6 +49,100 @@ jobs:
           grep -iE "level=FATAL|level=ERROR" sc.log | tail -8 || true
           ls -la output/ 2>/dev/null || true
 
+      - name: Connectivity test (TCP + HTTP)
+        run: |
+          python3 - <<'PY'
+          import glob, json, re, sys, subprocess, os, urllib.request, urllib.parse, concurrent.futures as cf
+          
+          def load_yaml(path):
+              try:
+                  import yaml
+                  return yaml.safe_load(open(path, encoding="utf-8")) or {}
+              except ImportError:
+                  return None
+          
+          def parse_clash(path):
+              proxies, cur = [], None
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  if line.strip().startswith("- ") and "type:" in line:
+                      if cur: proxies.append(cur)
+                      cur = {}; body = line.strip()[2:]
+                      mm = re.match(r"([A-Za-z0-9_-]+):\s*(.*)$", body)
+                      if mm: cur[mm.group(1)] = mm.group(2).strip().strip('"')
+                      continue
+                  if cur is not None and line.startswith("      "):
+                      mm = re.match(r"\s*([A-Za-z0-9_-]+):\s*(.*)$", line)
+                      if mm: cur[mm.group(1)] = mm.group(2).strip().strip('"')
+              if cur: proxies.append(cur)
+              return {"proxies": proxies}
+          
+          def main():
+              files = glob.glob("output/*.yaml") + glob.glob("output/*.yml")
+              if not files:
+                  print("no output files"); sys.exit(0)
+              proxies = []
+              for f in files:
+                  d = load_yaml(f)
+                  if d is None: d = parse_clash(f)
+                  proxies += d.get("proxies") or []
+              print(f"loaded {len(proxies)} proxies from {len(files)} files")
+              
+              # start a temporary mihomo with all proxies
+              cfg = {
+                  "mixed-port": 17890,
+                  "external-controller": "127.0.0.1:19090",
+                  "log-level": "warning",
+                  "proxies": proxies,
+                  "proxy-groups": [{"name": "SEL", "type": "select", "proxies": [p["name"] for p in proxies]}],
+                  "rules": ["MATCH,SEL"]
+              }
+              import tempfile, json as _json
+              with tempfile.TemporaryDirectory() as td:
+                  cfg_path = os.path.join(td, "cfg.yaml")
+                  with open(cfg_path, "w") as f: _json.dump(cfg, f)
+                  mihomo_bin = os.environ.get("MIHOMO_BIN", "mihomo")
+                  proc = subprocess.Popen([mihomo_bin, "-d", td, "-f", cfg_path],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  time.sleep(3)
+                  try:
+                      # test each proxy via REST API
+                      alive = []
+                      def test_one(name):
+                          try:
+                              url = f"http://127.0.0.1:19090/proxies/{urllib.parse.quote(name)}/delay?timeout=5000&url=http://cp.cloudflare.com/generate_204"
+                              req = urllib.request.Request(url, headers={"User-Agent": "test"})
+                              with urllib.request.urlopen(req, timeout=10) as r:
+                                  d = json.load(r)
+                                  delay = d.get("delay")
+                                  if delay and delay > 0:
+                                      return (name, delay)
+                          except Exception:
+                              pass
+                          return None
+                      names = [p["name"] for p in proxies]
+                      with cf.ThreadPoolExecutor(50) as ex:
+                          results = list(ex.map(test_one, names))
+                      alive = [r for r in results if r]
+                      print(f"alive {len(alive)}/{len(proxies)}")
+                      alive_names = {r[0] for r in alive}
+                      # filter proxies
+                      alive_proxies = [p for p in proxies if p["name"] in alive_names]
+                      # write filtered
+                      for f in glob.glob("output/*.yaml") + glob.glob("output/*.yml"):
+                          d = load_yaml(f)
+                          if d is None: d = parse_clash(f)
+                          if d and d.get("proxies"):
+                              d["proxies"] = [p for p in d["proxies"] if p["name"] in alive_names]
+                              import yaml
+                              with open(f, "w") as fh:
+                                  yaml.dump(d, fh, allow_unicode=True, sort_keys=False)
+                      print(f"filtered: {len(proxies)} -> {len(alive_proxies)}")
+                  finally:
+                      proc.terminate()
+                      proc.wait(timeout=5)
+          main()
+          PY
+
       - name: Enrich + grade -> nodes.json
         run: |
           python3 -m pip install -q pyyaml 2>/dev/null || pip install -q pyyaml

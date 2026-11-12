@@ -1,14 +1,12 @@
 name: subs-check
 
-# 独立跑在 GitHub 免费机器上，不消耗老板 VPS 流量
-# subs-check 是长驻 daemon，这里用 timeout 只让它跑一轮就退出 —— 根治"几天不重启就不更新"
 on:
   schedule:
-    - cron: "17 */6 * * *"      # 每 6 小时一轮（错开整点，避开机场 0 点重启）
-  workflow_dispatch:            # 允许手动立刻跑一轮
+    - cron: "23 */6 * * *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write   # 需要写权限：nodes.b64 自动提交回本仓库
+  contents: write
 
 jobs:
   check:
@@ -20,88 +18,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 下载 subs-check 最新版
+      - name: Download subs-check
         run: |
           set -e
-          REL=$(curl -s -H "Authorization: Bearer $GH_TOK" \
-                https://api.github.com/repos/beck-8/subs-check/releases/latest)
+          REL=$(curl -s -H "Authorization: Bearer $GH_TOK" https://api.github.com/repos/beck-8/subs-check/releases/latest)
           VER=$(echo "$REL" | jq -r '.tag_name // empty')
           ASSET=$(echo "$REL" | jq -r '.assets[]? | select(.name|test("Linux_x86_64\\.tar\\.gz")) | .browser_download_url' | head -1)
-          if [ -z "$VER" ] || [ "$VER" = "null" ]; then VER="$FALLBACK_VER"; echo "API 受限，回退到 $VER"; fi
           if [ -z "$ASSET" ] || [ "$ASSET" = "null" ]; then
-            ASSET="https://github.com/beck-8/subs-check/releases/download/${VER}/subs-check_Linux_x86_64.tar.gz"
+            ASSET="https://github.com/beck-8/subs-check/releases/download/${VER:-$FALLBACK_VER}/subs-check_Linux_x86_64.tar.gz"
           fi
-          echo "version=$VER"; echo "asset=$ASSET"
+          echo "version=$VER asset=$ASSET"
           curl -sSL --retry 3 -o sc.tar.gz "$ASSET"
-          ls -la sc.tar.gz
           tar xzf sc.tar.gz
           BIN=$(find . -path ./.github -prune -o -type f -name 'subs-check' -print | head -1)
-          if [ -z "$BIN" ]; then
-            BIN=$(find . -path ./.github -prune -o -type f -name 'subs-check*' ! -name '*.gz' ! -name '*.yml' -print | head -1)
-          fi
-          echo "bin=$BIN"
           chmod +x "$BIN"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-      - name: 注入 Gist 凭据（不入库）
-        run: |
-          python3 - <<'PY'
-          import re,os
-          p="config.yaml"; s=open(p,encoding="utf-8").read()
-          s=re.sub(r'github-gist-id:\s*""', 'github-gist-id: "%s"'%os.environ["GIST_ID"], s)
-          # subs-check 的正确键名是 github-token（写成 github-gist-token 会报"Gist配置不完整"）
-          s=re.sub(r'github-token:\s*""', 'github-token: "%s"'%os.environ["GIST_TOKEN"], s)
-          open(p,"w",encoding="utf-8").write(s)
-          print("gist id 已注入:", os.environ["GIST_ID"][:8]+"...")
-          print("注入后的 github-* 行:", [l for l in s.splitlines() if l.startswith("github-")])
-          PY
-        env:
-          GIST_ID: ${{ secrets.GIST_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-
-      - name: 跑一轮检测（跑完即退出）
+      - name: Run one round
         run: |
           "$BIN" -f config.yaml > sc.log 2>&1 &
-          PID=$!
-          DONE=0
+          PID=$!; DONE=0
           for i in $(seq 1 290); do
             sleep 10
-            if grep -qE "检测完成" sc.log; then DONE=1; echo "本轮完成，用时约 $((i*10))s"; break; fi
-            if ! kill -0 $PID 2>/dev/null; then echo "进程自行退出"; DONE=1; break; fi
+            if grep -qE "检测完成" sc.log; then DONE=1; echo "done in ~$((i*10))s"; break; fi
+            if ! kill -0 $PID 2>/dev/null; then DONE=1; echo "exited"; break; fi
           done
-          [ "$DONE" = "0" ] && echo "约4800s 未完成，强制停止"
-          sleep 8
-          kill $PID 2>/dev/null || true
-          echo "--- 关键统计 ---"
-          grep -E "合并去重后节点数量|存活节点数量|流媒体检测通过|可用节点数量|消耗流量|保存成功|Gist|达到成功数量限制" sc.log | tail -20 || true
-          echo "--- 报错 ---"
+          [ "$DONE" = "0" ] && echo "timeout, force stop"
+          sleep 8; kill $PID 2>/dev/null || true
+          grep -E "合并去重后节点数量|存活节点数量|流媒体检测通过|可用节点数量|消耗流量" sc.log | tail -20 || true
           grep -iE "level=FATAL|level=ERROR" sc.log | tail -8 || true
-          echo "--- output ---"; ls -la output/ 2>/dev/null || true
+          ls -la output/ 2>/dev/null || true
 
-      - name: 同步节点池（推 tv-nodes 自身 + Gitee tv-sources，App 直连拉取用）
+      - name: Enrich + grade -> nodes.json
+        run: |
+          python3 -m pip install -q pyyaml 2>/dev/null || pip install -q pyyaml
+          python3 enrich.py
+
+      - name: Commit results
         run: |
           set -e
-          SRC=$(ls output/*.yaml output/*.yml 2>/dev/null | head -1)
-          if [ -z "$SRC" ]; then echo "本轮没有输出文件，跳过同步"; exit 0; fi
-          echo "节点池源文件: $SRC ($(wc -c < "$SRC") bytes)"
-          base64 -w0 "$SRC" > nodes.b64
-          # GitHub：直接提交到 tv-nodes 自身（GITHUB_TOKEN 原生可写，永不失效；App 的 GitHub 兜底 URL 指这里）
-          git config user.name "tv-nodes-bot" && git config user.email "bot@localhost"
-          git add nodes.b64
-          git commit -q -m "nodes.b64 自动同步 $(date -u +%F\ %R)UTC" || echo "GitHub 无变化"
-          git push -q origin HEAD:main && echo "GitHub(tv-nodes) 推送完成"
-          # Gitee 镜像（国内直连主通道；GITEE_TOKEN = Gitee 私人令牌 projects 权限）
-          git clone -q --depth 1 "https://yh-music:${GITEE_TOKEN}@gitee.com/yh-music/tv-sources.git" gtdst
-          cp nodes.b64 gtdst/nodes.b64
-          cd gtdst
-          git config user.name "tv-nodes-bot" && git config user.email "bot@localhost"
-          git add nodes.b64
-          git commit -q -m "nodes.b64 自动同步 $(date -u +%F\ %R)UTC" || echo "Gitee 无变化"
-          git push -q origin main && echo "Gitee(tv-sources) 推送完成"
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          git config user.name "node-bot"; git config user.email "bot@localhost"
+          git add nodes.json 2>/dev/null || true
+          git commit -q -m "auto update $(date -u +%F\ %R)UTC" || echo "no change"
+          git push -q origin HEAD:main && echo pushed
+          wc -c nodes.json 2>/dev/null || true
 
-      - name: 备份本轮输出到 Actions 制品（便于排查）
+      - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:

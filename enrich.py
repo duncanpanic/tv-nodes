@@ -92,7 +92,11 @@ def main():
         if letter == "F": continue  # reject unencrypted / weak-cipher
         name = p.get("name", "")
         m = re.search(r"\|([0-9.]+)\s*MB/s", name); speed = float(m.group(1)) if m else 0.0
-        r = re.search(r"\|(\d+)%", name);            risk  = int(r.group(1))  if r else 50
+        # subs-check 将 iprisk 写在节点名里，格式：...|速度|风险%|解锁...
+        # 例：🇺🇸US_193|38.0MB/s|0%|YT-US|NF-US  -> risk=0
+        # 支持整数、小数，兜底 50
+        r = re.search(r"\|(\d+(?:\.\d+)?)%", name)
+        risk = float(r.group(1)) if r else 50.0
         c = re.search(r"([A-Z]{2})_?\d", name);      cc    = c.group(1)       if c else ""
         pos = cc_centroid(cc)
         if not pos: continue  # need a location for the globe

@@ -39,11 +39,14 @@ jobs:
           set -e
           REL=$(curl -s -H "Authorization: Bearer $GH_TOK" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
           VER=$(echo "$REL" | jq -r '.tag_name // empty')
-          ASSET=$(echo "$REL" | jq -r '.assets[]? | select(.name|test("linux-amd64-v3\\.gz$")) | .browser_download_url' | head -1)
-          if [ -z "$ASSET" ] || [ "$ASSET" = "null" ]; then
-            VER=${VER:-v1.19.8}
-            ASSET="https://github.com/MetaCubeX/mihomo/releases/download/${VER}/mihomo-linux-amd64-v3.gz"
+          # asset 名带版本号，如 mihomo-linux-amd64-v3-v1.19.34.gz
+          BASE="mihomo-linux-amd64-v1"
+          NAME=$(echo "$REL" | jq -r --arg b "$BASE" '.assets[]?.name | select(test("^" + $b + "-v.*\\.gz$"))' | head -1)
+          if [ -z "$NAME" ] || [ "$NAME" = "null" ]; then
+            VER=${VER:-v1.19.34}
+            NAME="${BASE}-${VER}.gz"
           fi
+          ASSET="https://github.com/MetaCubeX/mihomo/releases/download/${VER}/${NAME}"
           echo "mihomo version=$VER asset=$ASSET"
           curl -sSL --retry 3 -o mihomo.gz "$ASSET"
           gunzip -c mihomo.gz > mihomo

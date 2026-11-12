@@ -58,6 +58,84 @@ jobs:
         run: |
           set -e
           git config user.name "node-bot"; git config user.email "bot@localhost"
+          git add nodes.json top10.yaml 2>/dev/null || true
+          git commit -q -m "auto update $(date -u +%F\ %R)UTC" || echo "no change"
+          # remote may have moved on (config edits, previous run) -> rebase before push
+          for i in 1 2 3; do
+            git pull --rebase --autostash -q origin main || true
+            if git push -q origin HEAD:main; then echo pushed; break; fi
+            echo "push retry $i"; sleep 5
+          done
+          wc -c nodes.json top10.yaml 2>/dev/null || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodes-run
+          path: output/
+          retention-days: 3
+          if-no-files-found: ignore
+name: subs-check
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOK: ${{ secrets.GITHUB_TOKEN }}
+      FALLBACK_VER: v1.6.5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download subs-check
+        run: |
+          set -e
+          REL=$(curl -s -H "Authorization: Bearer $GH_TOK" https://api.github.com/repos/beck-8/subs-check/releases/latest)
+          VER=$(echo "$REL" | jq -r '.tag_name // empty')
+          ASSET=$(echo "$REL" | jq -r '.assets[]? | select(.name|test("Linux_x86_64\\.tar\\.gz")) | .browser_download_url' | head -1)
+          if [ -z "$ASSET" ] || [ "$ASSET" = "null" ]; then
+            ASSET="https://github.com/beck-8/subs-check/releases/download/${VER:-$FALLBACK_VER}/subs-check_Linux_x86_64.tar.gz"
+          fi
+          echo "version=$VER asset=$ASSET"
+          curl -sSL --retry 3 -o sc.tar.gz "$ASSET"
+          tar xzf sc.tar.gz
+          BIN=$(find . -path ./.github -prune -o -type f -name 'subs-check' -print | head -1)
+          chmod +x "$BIN"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Run one round
+        run: |
+          "$BIN" -f config.yaml > sc.log 2>&1 &
+          PID=$!; DONE=0
+          for i in $(seq 1 290); do
+            sleep 10
+            if grep -qE "检测完成" sc.log; then DONE=1; echo "done in ~$((i*10))s"; break; fi
+            if ! kill -0 $PID 2>/dev/null; then DONE=1; echo "exited"; break; fi
+          done
+          [ "$DONE" = "0" ] && echo "timeout, force stop"
+          sleep 8; kill $PID 2>/dev/null || true
+          grep -E "合并去重后节点数量|存活节点数量|流媒体检测通过|可用节点数量|消耗流量" sc.log | tail -20 || true
+          grep -iE "level=FATAL|level=ERROR" sc.log | tail -8 || true
+          ls -la output/ 2>/dev/null || true
+
+      - name: Enrich + grade -> nodes.json
+        run: |
+          python3 -m pip install -q pyyaml 2>/dev/null || pip install -q pyyaml
+          python3 enrich.py
+
+      - name: Commit results
+        run: |
+          set -e
+          git config user.name "node-bot"; git config user.email "bot@localhost"
           git add nodes.json 2>/dev/null || true
           git commit -q -m "auto update $(date -u +%F\ %R)UTC" || echo "no change"
           git push -q origin HEAD:main && echo pushed

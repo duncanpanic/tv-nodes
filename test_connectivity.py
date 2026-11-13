@@ -57,8 +57,8 @@ def dump_yaml(doc, path):
 def test_one(name):
     url = (
         f"http://127.0.0.1:{CTRL_PORT}/proxies/"
-        f"{urllib.parse.quote(name)}/delay"
-        f"?timeout=5000&url=http://cp.cloudflare.com/generate_204"
+        f"{urllib.parse.quote(name, safe='')}/delay"
+        f"?timeout=4000&url=http://cp.cloudflare.com/generate_204"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "connectivity-test"})
     try:

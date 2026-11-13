@@ -12,6 +12,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 MIXED_PORT = 17890
 CTRL_PORT = 19090
+TEST_URL = "http://cp.cloudflare.com/generate_204"
+CTRL_TIMEOUT = 12
+DIAL_TIMEOUT = 4000
+MAX_WAIT_READY = 20
+RETRY_READY = 10
 
 
 def load_yaml(path):
@@ -54,15 +59,29 @@ def dump_yaml(doc, path):
         return False
 
 
-def test_one(name):
+def wait_ready(ctrl_port, max_wait=MAX_WAIT_READY, retry=RETRY_READY):
+    url = f"http://127.0.0.1:{ctrl_port}/version"
+    for i in range(retry):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{ctrl_port}/version", headers={"User-Agent": "ready-check"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(max_wait / retry)
+    return False
+
+
+def test_one(name, ctrl_port=CTRL_PORT, dial_timeout=DIAL_TIMEOUT):
     url = (
-        f"http://127.0.0.1:{CTRL_PORT}/proxies/"
+        f"http://127.0.0.1:{ctrl_port}/proxies/"
         f"{urllib.parse.quote(name, safe='')}/delay"
-        f"?timeout=4000&url=http://cp.cloudflare.com/generate_204"
+        f"?timeout={dial_timeout}&url=http://cp.cloudflare.com/generate_204"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "connectivity-test"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=CTRL_TIMEOUT) as r:
             delay = json.load(r).get("delay")
             if delay and delay > 0:
                 return (name, delay)
@@ -95,13 +114,11 @@ def main():
         sys.exit(0)
 
     cfg = {
-        "mixed-port": MIXED_PORT,
-        "external-controller": f"127.0.0.1:{CTRL_PORT}",
+        "mixed-port": 17890,
+        "external-controller": "127.0.0.1:19090",
         "log-level": "warning",
         "proxies": proxies,
-        "proxy-groups": [
-            {"name": "SEL", "type": "select", "proxies": [p["name"] for p in proxies]}
-        ],
+        "proxy-groups": [{"name": "SEL", "type": "select", "proxies": [p["name"] for p in proxies]}],
         "rules": ["MATCH,SEL"],
     }
 
@@ -115,7 +132,13 @@ def main():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(4)
+        # wait for controller ready
+        if not wait_ready(19090):
+            print("mihomo controller not ready")
+            proc.terminate()
+            proc.wait(timeout=8)
+            sys.exit(1)
+        time.sleep(2)  # extra grace
 
         try:
             names = [p["name"] for p in proxies]
@@ -135,7 +158,6 @@ def main():
                     d["proxies"] = [p for p in d["proxies"] if p["name"] in alive_names]
                     kept += len(d["proxies"])
                     if not dump_yaml(d, f):
-                        # fallback: skip rewrite, print warning
                         print(f"WARN: cannot rewrite {f} (pyyaml missing)")
             print(f"filtered: {len(proxies)} -> {kept}")
         finally:
@@ -148,3 +170,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

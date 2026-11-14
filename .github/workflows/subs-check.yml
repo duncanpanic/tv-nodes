@@ -1,9 +1,9 @@
 name: subs-check
 
-# 每 6 小时抓一轮公开免费节点，产出 nodes.json + top10.yaml 给 3D 地球小站用。
-# 注意：这个文件本身是 YAML，里面不要再写"未缩进的 heredoc"（会直接把整个
-# workflow 变成语法错误，Actions 会 0 秒失败）。所有配置都放仓库根目录的
-# config.yaml，单一事实来源。
+# 每 6 小时抓一轮公开免费节点。节点数据（含服务器地址/密码）不落公开仓库：
+# 产物放进 workflow artifact，由国内网关的 tv-nodes-cn.service 下载 artifact
+# 做直连过滤，结果（nodes.json/top10.yaml）写进私密仓 duncanpanic/tv-nodes-private。
+# 注意：这个文件本身是 YAML，里面不要再写"未缩进的 heredoc"。
 
 on:
   schedule:
@@ -28,6 +28,13 @@ jobs:
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download previous candidate pool (artifact)
+        uses: actions/download-artifact@v4
+        with:
+          name: nodes-run
+          path: prev/
+        continue-on-error: true
 
       - name: Download subs-check
         run: |
@@ -71,6 +78,11 @@ jobs:
 
       - name: Run subs-check one round
         run: |
+          # keep-days 需要历史文件才能做"上一轮活节点这轮复测"；artifact 恢复到 output/
+          if [ -d prev/output ] && [ -s prev/output/all.yaml ]; then
+            mkdir -p output
+            cp prev/output/all.yaml output/all.yaml || true
+          fi
           rm -rf output
           "$BIN" -f config.yaml > sc.log 2>&1 &
           PID=$!; DONE=0
@@ -100,7 +112,7 @@ jobs:
           python3 -c "import yaml" 2>/dev/null && echo "pyyaml: yes" || echo "pyyaml: no (fallback parser)"
           python3 enrich.py
 
-      - name: Commit results
+      - name: Validate results
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -112,37 +124,6 @@ jobs:
           print("nodes.json ok: top10=%d strict=%d scanned=%d" % (
               len(d["top10"]), d.get("strict_count", 0), d.get("source_count", 0)))
           PY
-          # all.yaml 是全量候选节点池，提交回仓库供国内网关拉取做直连过滤
-          cp output/all.yaml all.yaml
-          git config user.name "node-bot"
-          git config user.email "bot@localhost"
-          for i in 1 2 3 4 5; do
-            git fetch -q origin main
-            # 把我们的数据变更重放到最新 origin/main 之上：永远不会产生 merge 冲突
-            git reset -q --soft FETCH_HEAD
-            git add nodes.json top10.yaml all.yaml
-            if git diff --cached --quiet; then
-              echo "no change"
-              exit 0
-            fi
-            git commit -q -m "auto update $(date -u +%FT%TZ)"
-            if git push -q origin HEAD:main; then
-              echo "pushed"
-              exit 0
-            fi
-            echo "push retry $i"
-            sleep 5
-          done
-          echo "::error::push failed after 5 retries"
-          exit 1
-
-      - name: Purge jsDelivr cache
-        if: always()
-        run: |
-          for f in nodes.json top10.yaml; do
-            printf '%s: %s\n' "$f" \
-              "$(curl -s --max-time 20 "https://purge.jsdelivr.net/gh/duncanpanic/tv-nodes@main/$f" | head -c 160)"
-          done
 
       - name: Upload artifact
         if: always()
@@ -153,5 +134,6 @@ jobs:
             output/
             nodes.json
             top10.yaml
-          retention-days: 3
+          # candidate pool must outlive the next scheduled round (6h) with margin
+          retention-days: 2
           if-no-files-found: ignore

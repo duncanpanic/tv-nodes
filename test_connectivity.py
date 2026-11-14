@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Connectivity test: filter Clash proxies that actually respond.
+"""[未启用 / DO NOT WIRE INTO CI]
+
+这个脚本在 2026-11-13 那次运行里把 subs-check 已经用真 mihomo 内核拨号验证过的
+1051 个节点全部判成 0 个存活，并覆盖掉了 output/all.yaml，直接把 nodes.json
+变成了空数据。它的 mihomo REST API 调用本身是坏的（活着/死了都是 0）。
+
+保留仅作参考。要用必须先修好并先用一份 all.yaml 验证它能输出非零结果。
+
+Connectivity test: filter Clash proxies that actually respond.
 
 Reads output/*.yaml, spins up a temporary mihomo (MIHOMO_BIN), dial-tests each
 node via the REST API (generate_204), and rewrites the same files keeping only

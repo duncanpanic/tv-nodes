@@ -1,5 +1,10 @@
 name: subs-check
 
+# 每 6 小时抓一轮公开免费节点，产出 nodes.json + top10.yaml 给 3D 地球小站用。
+# 注意：这个文件本身是 YAML，里面不要再写"未缩进的 heredoc"（会直接把整个
+# workflow 变成语法错误，Actions 会 0 秒失败）。所有配置都放仓库根目录的
+# config.yaml，单一事实来源。
+
 on:
   schedule:
     - cron: "23 */6 * * *"
@@ -8,6 +13,11 @@ on:
 permissions:
   contents: write
 
+# 同一时间只跑一轮，避免两次运行互抢 commit
+concurrency:
+  group: subs-check
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -15,6 +25,7 @@ jobs:
     env:
       GH_TOK: ${{ secrets.GITHUB_TOKEN }}
       FALLBACK_VER: v1.6.5
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +45,7 @@ jobs:
           chmod +x "$BIN"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-      - name: Download mihomo core (for subs-check internal use)
+      - name: Download mihomo core
         run: |
           set -e
           REL=$(curl -s -H "Authorization: Bearer $GH_TOK" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
@@ -51,84 +62,19 @@ jobs:
           chmod +x mihomo
           echo "MIHOMO_BIN=$PWD/mihomo" >> "$GITHUB_ENV"
 
-      - name: Debug - Show runner network info
+      - name: Runner network sanity check
         run: |
-          echo "=== Runner IP ==="
-          curl -s http://ip-api.com/json/ || true
-          echo ""
-          echo "=== DNS Resolution Test ==="
-          for h in gstatic.com cloudflare.com github.com; do
-            echo -n "$h: "
-            dig +short $h A | head -1 || echo "FAIL"
+          echo "runner ip: $(curl -s --max-time 8 http://ip-api.com/json/ | head -c 200)"
+          for u in http://gstatic.com/generate_204 http://cp.cloudflare.com/generate_204; do
+            printf '%s -> %s\n' "$u" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$u")"
           done
-          echo ""
-          echo "=== TCP Connect Test (gstatic.com:80) ==="
-          timeout 5 bash -c "cat < /dev/null > /dev/tcp/gstatic.com/80" && echo "OK" || echo "FAIL"
-          echo ""
-          echo "=== Runner Environment ==="
-          uname -a
-          free -h
-          df -h /
-
-      - name: Create subs-check config with connectivity test
-        run: |
-          cat > config.yaml <<'EOF'
-print-progress: true
-concurrent: 50
-media-concurrent: 20
-speed-concurrent: 20
-shuffle-test-order: true
-check-interval: 1440
-success-limit: 0
-timeout: 8000
-alive-test-url: http://cp.cloudflare.com/generate_204
-speed-test-url: https://github.com/AaronFeng753/Waifu2x-Extension-GUI/releases/download/v2.21.12/Waifu2x-Extension-GUI-v2.21.12-Portable.7z
-min-speed: 512
-download-timeout: 15
-download-mb: 20
-total-speed-limit: 0
-listen-port: ":8199"
-rename-node: true
-node-prefix: ""
-media-check: true
-media-check-timeout: 10
-platforms:
-  - iprisk
-  - youtube
-  - netflix
-  - disney
-keep-days: 7
-output-dir: "output"
-enable-web-ui: false
-save-method: local
-sub-urls:
-  - "https://raw.githubusercontent.com/firefoxmmx2/v2rayshare_subcription/main/subscription/clash_sub.yaml"
-  - "https://raw.githubusercontent.com/Q3dlaXpoaQ/V2rayN_Clash_Node_Getter/refs/heads/main/APIs/sc0.yaml"
-  - "https://raw.githubusercontent.com/mahdibland/SSAggregator/master/sub/sub_merge_yaml.yml"
-  - "https://raw.githubusercontent.com/chengaopan/AutoMergePublicNodes/master/list.yml"
-  - "https://raw.githubusercontent.com/zhangkaiitugithub/passcro/main/speednodes.yaml"
-  - "https://raw.githubusercontent.com/aiboboxx/v2rayfree/refs/heads/main/README.md"
-  - "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/snippets/nodes.meta.yml"
-  - "https://raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml"
-  - "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt"
-  - "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"
-  - "https://raw.githubusercontent.com/go4sharing/sub/main/sub.yaml"
-  - "https://raw.githubusercontent.com/actionsfz/v2ray/refs/heads/master/all.yaml"
-  - "https://raw.githubusercontent.com/Pawdroid/Free-servers/refs/heads/main/sub"
-  - "https://raw.githubusercontent.com/acymz/AutoVPN/main/data/V2.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/wenode.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayshare.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/nodefree.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/ndnode.txt"
-  - "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/clashmeta.txt"
-  - "https://raw.githubusercontent.com/xiaoji235/airport-free/main/v2ray.txt"
-EOF
 
       - name: Run subs-check one round
         run: |
+          rm -rf output
           "$BIN" -f config.yaml > sc.log 2>&1 &
           PID=$!; DONE=0
-          for i in $(seq 1 360); do
+          for i in $(seq 1 290); do
             sleep 10
             if grep -qE "检测完成" sc.log; then DONE=1; echo "done in ~$((i*10))s"; break; fi
             if ! kill -0 $PID 2>/dev/null; then DONE=1; echo "exited"; break; fi
@@ -138,30 +84,72 @@ EOF
           grep -E "合并去重后节点数量|存活节点数量|流媒体检测通过|可用节点数量|消耗流量" sc.log | tail -20 || true
           grep -iE "level=FATAL|level=ERROR" sc.log | tail -8 || true
           ls -la output/ 2>/dev/null || true
+          if [ ! -s output/all.yaml ]; then
+            echo "::error::subs-check produced no output/all.yaml"
+            tail -60 sc.log
+            exit 1
+          fi
 
+      # 说明：曾经在这里插过 test_connectivity.py（用 mihomo REST API 再筛一道），
+      # 它把 1051 个已经过 subs-check 真拨号验证的节点判成 0 个存活并覆盖了
+      # output/all.yaml，导致 nodes.json 变成空数据。当前流程不再使用它。
       - name: Enrich + grade -> nodes.json
         run: |
-          python3 -m pip install -q pyyaml 2>/dev/null || true
+          python3 -m pip install -q --break-system-packages pyyaml 2>/dev/null \
+            || python3 -m pip install -q pyyaml 2>/dev/null || true
+          python3 -c "import yaml" 2>/dev/null && echo "pyyaml: yes" || echo "pyyaml: no (fallback parser)"
           python3 enrich.py
 
       - name: Commit results
         run: |
-          set -e
-          git config user.name "node-bot"; git config user.email "bot@localhost"
-          git add nodes.json top10.yaml 2>/dev/null || true
-          git commit -q -m "auto update $(date -u +%F\ %R)UTC" || echo "no change"
-          for i in 1 2 3; do
-            git pull --rebase --autostash -q origin main || true
-            if git push -q origin HEAD:main; then echo pushed; break; fi
-            echo "push retry $i"; sleep 5
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          d = json.load(open("nodes.json", encoding="utf-8"))
+          assert d.get("top10"), "top10 is empty"
+          blob = open("nodes.json", encoding="utf-8").read()
+          assert "<<<<<<<" not in blob and ">>>>>>>" not in blob, "conflict markers in nodes.json"
+          print("nodes.json ok: top10=%d strict=%d scanned=%d" % (
+              len(d["top10"]), d.get("strict_count", 0), d.get("source_count", 0)))
+          PY
+          git config user.name "node-bot"
+          git config user.email "bot@localhost"
+          for i in 1 2 3 4 5; do
+            git fetch -q origin main
+            # 把我们的数据变更重放到最新 origin/main 之上：永远不会产生 merge 冲突
+            git reset -q --soft FETCH_HEAD
+            git add nodes.json top10.yaml
+            if git diff --cached --quiet; then
+              echo "no change"
+              exit 0
+            fi
+            git commit -q -m "auto update $(date -u +%FT%TZ)"
+            if git push -q origin HEAD:main; then
+              echo "pushed"
+              exit 0
+            fi
+            echo "push retry $i"
+            sleep 5
           done
-          wc -c nodes.json top10.yaml 2>/dev/null || true
+          echo "::error::push failed after 5 retries"
+          exit 1
+
+      - name: Purge jsDelivr cache
+        if: always()
+        run: |
+          for f in nodes.json top10.yaml; do
+            printf '%s: %s\n' "$f" \
+              "$(curl -s --max-time 20 "https://purge.jsdelivr.net/gh/duncanpanic/tv-nodes@main/$f" | head -c 160)"
+          done
 
       - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nodes-run
-          path: output/
+          path: |
+            output/
+            nodes.json
+            top10.yaml
           retention-days: 3
           if-no-files-found: ignore

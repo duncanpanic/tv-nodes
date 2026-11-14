@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Parse subs-check output -> grade protocols -> score -> pick Top10.
-No per-node geo API calls: country is parsed from the node name and mapped to a
-built-in country centroid for globe placement."""
+
+No per-node geo API calls: the country comes from the node name (subs-check
+renames every tested node to "🇩🇪DE_122|5.0MB/s|0%|YT-US|NF-HU") and is mapped
+to a built-in centroid for globe placement.
+
+Exit codes: 0 = nodes.json/top10.yaml written, 1 = nothing usable -> old data
+files are left untouched so the published site keeps working.
+"""
 import glob, json, math, re, sys, time, collections
 
 OUT = "nodes.json"
+TOP = "top10.yaml"
 
 WEAK_CIPHER = ("rc4", "table", "none", "des-cfb", "bf-cfb",
                "aes-128-cfb", "aes-256-cfb", "chacha20-ietf", "chacha20-poly1305")
+
 
 def grade(p):
     """(letter, enc_score 0-100, label). A+ >=95, A >=85, B >=60, F = reject."""
@@ -25,6 +33,7 @@ def grade(p):
         if any(w in c for w in WEAK_CIPHER): return "F", 0, "ss-weak"
         return ("A+", 100, "ss2022") if "2022" in c else ("B", 60, "ss-aead")
     return "F", 0, t or "unknown"
+
 
 # country code -> [lat, lon] centroid (subset used for globe pins)
 CENTROID = {
@@ -48,127 +57,258 @@ CENTROID = {
  "CM":[6,12],"CD":[-2,23],"ZM":[-13,28],"ZW":[-19,30],"MZ":[-18,35],"AO":[-12,17],"SD":[15,30],
  "MU":[-20,57],"SC":[-5,55],
 }
+
+
 def cc_centroid(cc):
     return CENTROID.get((cc or "").upper())
+
+
+# ---------------------------------------------------------------- YAML loading
+def _uncomment(s):
+    out, q = [], None
+    for i, ch in enumerate(s):
+        if q:
+            out.append(ch)
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+            out.append(ch)
+        elif ch == "#" and (i == 0 or s[i - 1] in " \t"):
+            break
+        else:
+            out.append(ch)
+    return "".join(out).rstrip()
+
+
+_ESC = re.compile(r"\\U([0-9a-fA-F]{8})|\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\[ntr\"\\\\]")
+
+
+def _unescape(body):
+    def rep(m):
+        if m.group(1):
+            return chr(int(m.group(1), 16))
+        if m.group(2):
+            return chr(int(m.group(2), 16))
+        if m.group(3):
+            return chr(int(m.group(3), 16))
+        return {"\\n": "\n", "\\t": "\t", "\\r": "\r", '\\"': '"', "\\\\": "\\"}.get(m.group(0), m.group(0))
+    return _ESC.sub(rep, body)
+
+
+def _scalar(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        body = v[1:-1]
+        if v[0] == '"' and "\\" in body:
+            body = _unescape(body)
+        return body
+    if v in ("true", "True", "TRUE"): return True
+    if v in ("false", "False", "FALSE"): return False
+    if v in ("", "null", "Null", "~"): return None
+    if re.fullmatch(r"-?\d+", v): return int(v)
+    if re.fullmatch(r"-?\d*\.\d+", v): return float(v)
+    return v
+
+
+class _Frame:
+    __slots__ = ("indent", "obj", "owner", "key")
+
+    def __init__(self, indent, obj, owner=None, key=None):
+        self.indent, self.obj, self.owner, self.key = indent, obj, owner, key
+
+
+def parse_clash(path):
+    """Indentation-aware Clash YAML reader (used when pyyaml is unavailable).
+
+    Handles block sequences of block mappings with scalar values plus nested
+    maps / lists (reality-opts, ws-opts, alpn, ...) - i.e. the shape subs-check
+    writes into output/all.yaml.
+    """
+    root = {}
+    stack = [_Frame(-1, root)]
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        line = _uncomment(line)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        s = line.strip()
+        while len(stack) > 1 and stack[-1].indent >= indent:
+            stack.pop()
+        fr = stack[-1]
+        if s.startswith("- ") or s == "-":
+            # a "key:" waiting for a sequence -> turn its placeholder dict into a list
+            if isinstance(fr.obj, dict) and fr.owner is not None and fr.key is not None:
+                lst = []
+                fr.owner[fr.key] = lst
+                fr.obj, fr.owner, fr.key = lst, None, None
+            if not isinstance(fr.obj, list):
+                continue
+            item = {}
+            fr.obj.append(item)
+            stack.append(_Frame(indent, item))
+            body = s[2:].strip() if s.startswith("- ") else ""
+            if body:
+                m = re.match(r"^([\w.\-]+):\s*(.*)$", body)
+                if m:
+                    k, v = m.group(1), m.group(2)
+                    if v.strip() == "":
+                        child = {}
+                        item[k] = child
+                        stack.append(_Frame(indent + 2, child, item, k))
+                    else:
+                        item[k] = _scalar(v)
+            continue
+        m = re.match(r"^([\w.\-]+):\s*(.*)$", s)
+        if not m or not isinstance(fr.obj, dict):
+            continue
+        k, v = m.group(1), m.group(2)
+        if v.strip() == "":
+            child = {}
+            fr.obj[k] = child
+            stack.append(_Frame(indent, child, fr.obj, k))
+        else:
+            fr.obj[k] = _scalar(v)
+    return root
+
 
 def load_yaml(path):
     try:
         import yaml
-        return yaml.safe_load(open(path, encoding="utf-8")) or {}
     except ImportError:
         return None
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
-def parse_clash(path):
-    """Minimal Clash proxies parser (fallback when pyyaml absent)."""
-    proxies, cur = [], None
-    for line in open(path, encoding="utf-8", errors="replace"):
-        if line.strip().startswith("- ") and "type:" in line:
-            if cur: proxies.append(cur)
-            cur = {}; body = line.strip()[2:]
-            mm = re.match(r"([A-Za-z0-9_-]+):\s*(.*)$", body)
-            if mm: cur[mm.group(1)] = mm.group(2).strip().strip('"')
-            continue
-        if cur is not None and line.startswith("      "):
-            mm = re.match(r"\s*([A-Za-z0-9_-]+):\s*(.*)$", line)
-            if mm: cur[mm.group(1)] = mm.group(2).strip().strip('"')
-    if cur: proxies.append(cur)
-    return {"proxies": proxies}
+
+def dump_yaml(obj, path):
+    try:
+        import yaml
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(obj, f, allow_unicode=True, sort_keys=False)
+        return
+    except ImportError:
+        pass
+    # JSON is a subset of YAML 1.2 -> a valid Clash subscription file
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+# --------------------------------------------------------------------- scoring
+NAME_CC = re.compile(r"(?:^|[^A-Z])([A-Z]{2})(?:_\d|[\s\u4e00-\u9fff]|\||$)")
+SPEED = re.compile(r"\|\s*([0-9]+(?:\.[0-9]+)?)\s*MB/s", re.I)
+RISK = re.compile(r"\|\s*([0-9]+(?:\.[0-9]+)?)\s*%")
+UNLOCK = re.compile(r"\b(GPT|NF|YT|GM|D\+|CL|SP|TK)-?[A-Z]{0,2}")
+
+
+def read_name(name):
+    """-> (cc, speed MB/s, risk%, unlock tags) parsed from a subs-check name."""
+    cc = ""
+    m = NAME_CC.search(name)
+    if m:
+        cc = m.group(1)
+    sp = SPEED.search(name)
+    speed = float(sp.group(1)) if sp else 0.0
+    rk = RISK.search(name)
+    risk = float(rk.group(1)) if rk else 50.0
+    unlocks = []
+    for u in UNLOCK.findall(name):
+        if u not in unlocks:
+            unlocks.append(u)
+    return cc, speed, risk, unlocks
+
 
 def main():
-    files = glob.glob("output/*.yaml") + glob.glob("output/*.yml")
+    files = sorted(glob.glob("output/*.yaml") + glob.glob("output/*.yml"))
     if not files:
-        print("no output files"); sys.exit(0)
+        print("ERROR: no output/*.yaml from subs-check", file=sys.stderr)
+        return 1
     proxies = []
     for f in files:
         d = load_yaml(f)
-        if d is None: d = parse_clash(f)
-        proxies += d.get("proxies") or []
-    print(f"loaded {len(proxies)} proxies from {len(files)} files")
+        src = f"pyyaml {f}" if d is not None else f"fallback-parser {f}"
+        if d is None:
+            d = parse_clash(f)
+        got = d.get("proxies") or []
+        print(f"  {src}: {len(got)} proxies")
+        proxies += got
+    print(f"loaded {len(proxies)} proxies from {len(files)} file(s)")
+    if not proxies:
+        print("ERROR: subs-check output contained no proxies", file=sys.stderr)
+        return 1
 
-    scored = []
+    scored, seen = [], set()
     for p in proxies:
-        if not p.get("server") or not p.get("type"): continue
+        if not p.get("server") or not p.get("type"):
+            continue
         letter, enc, label = grade(p)
-        if letter == "F": continue  # reject unencrypted / weak-cipher
-        name = p.get("name", "")
-        m = re.search(r"\|([0-9.]+)\s*MB/s", name); speed = float(m.group(1)) if m else 0.0
-        # subs-check 将 iprisk 写在节点名里，格式：...|速度|风险%|解锁...
-        # 例：🇺🇸US_193|38.0MB/s|0%|YT-US|NF-US  -> risk=0
-        # 支持整数、小数，兜底 50
-        r = re.search(r"\|(\d+(?:\.\d+)?)%", name)
-        risk = float(r.group(1)) if r else 50.0
-        c = re.search(r"([A-Z]{2})_?\d", name);      cc    = c.group(1)       if c else ""
+        if letter == "F":
+            continue
+        key = (str(p.get("server")), str(p.get("port")), str(p.get("type")))
+        if key in seen:
+            continue
+        seen.add(key)
+        name = str(p.get("name") or "")
+        cc, speed, risk, unlocks = read_name(name)
         pos = cc_centroid(cc)
-        if not pos: continue  # need a location for the globe
-        unlocks = re.findall(r"\b(NF|YT|GPT|GM|D\+|CL|SP|TK)-?[A-Z]{0,2}", name)
+        if not pos:
+            continue
         scored.append(dict(name=name, type=p["type"], label=label, enc=enc,
                            cc=cc, city="", lat=pos[0], lon=pos[1],
                            speed=speed, risk=risk, unlocks=unlocks, raw=p))
-    print(f"A/A+ strict-encryption, geolocatable: {len(scored)}")
+    print(f"strict-encryption + geolocatable: {len(scored)}")
 
-    # ---- score: purity(risk) + encryption + speed ----
-    mx = max([s["speed"] for s in scored] + [0]) or 1
-    for s in scored:
+    timed = [s for s in scored if s["speed"] > 0]
+    print(f"with a measured speed this round: {len(timed)}")
+    pool = timed if timed else scored
+    if not pool:
+        print("ERROR: no usable node after grading", file=sys.stderr)
+        return 1
+
+    mx = max([s["speed"] for s in pool] + [0]) or 1
+    for s in pool:
         P = 100 - s["risk"]
         S = 100 * math.log1p(s["speed"]) / math.log1p(mx) if mx > 0 else 0
-        s["P"], s["S"] = round(P,1), round(S,1)
-        s["score"] = round(0.35*P + 0.25*s["enc"] + 0.20*S + 0.20*min(100,S), 1)
-    scored.sort(key=lambda x: -x["score"])
+        s["P"], s["S"] = round(P, 1), round(S, 1)
+        s["score"] = round(0.35 * P + 0.25 * s["enc"] + 0.20 * S + 0.20 * min(100, S), 1)
+    pool.sort(key=lambda x: (-x["score"], -x["speed"]))
 
-    # ---- top10 diversity: same country <=2, same IP/label spread ----
     top, cc_n = [], collections.Counter()
-    for s in scored:
-        if len(top) >= 10: break
-        if cc_n[s["cc"]] >= 2: continue
+    for s in pool:
+        if len(top) >= 10:
+            break
+        if cc_n[s["cc"]] >= 2:
+            continue
         cc_n[s["cc"]] += 1
         top.append(s)
 
     def pub(s):
         return {k: s.get(k) for k in
-                ("name","type","label","cc","lat","lon","risk","speed","enc","P","S","score","unlocks")}
+                ("name", "type", "label", "cc", "lat", "lon", "risk", "speed",
+                 "enc", "P", "S", "score", "unlocks")}
 
-    # ---- emit a usable Clash subscription of exactly these 10 ----
-    try:
-        import yaml as _yaml
-        out = []
-        for s_ in top:
-            r = dict(s_["raw"])
-            r["name"] = "%s|%s|%sMB/s|risk%s" % (
-                s_.get("cc") or "??", s_["label"], s_["speed"], s_["risk"])
-            out.append(r)
-        open("top10.yaml", "w", encoding="utf-8").write(
-            _yaml.safe_dump({"proxies": out}, allow_unicode=True, sort_keys=False))
-        print("wrote top10.yaml (%d nodes)" % len(out))
-    except Exception as e:
-        print("top10.yaml skipped:", e)
+    out = []
+    for s in top:
+        r = dict(s["raw"])
+        r["name"] = "%s_%s|%sMB/s|risk%s" % (s["cc"], s["label"], s["speed"],
+                                             int(s["risk"]) if float(s["risk"]).is_integer() else s["risk"])
+        out.append(r)
+    dump_yaml({"proxies": out}, TOP)
+    print(f"wrote {TOP} ({len(out)} nodes)")
+
     data = {"updated": int(time.time()), "source_count": len(proxies),
             "strict_count": len(scored), "top10": [pub(s) for s in top]}
-    json.dump(data, open(OUT,"w",encoding="utf-8"), ensure_ascii=False, separators=(",",":"))
+    with open(OUT, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
     print(f"wrote {OUT} top10={len(top)}")
-    for s in top: print(" ", s["cc"], s["label"], f"{s['speed']}MB/s", f"risk{s['risk']}%", f"score{s['score']}")
-
-def publish():
-    """Commit results from inside the runner (no workflow edit needed)."""
-    import os, subprocess
-    if not os.environ.get("GITHUB_ACTIONS"):
-        print("not in Actions, skip publish"); return
-    def run(*a, **kw):
-        r = subprocess.run(a, capture_output=True, text=True, **kw)
-        print("$", " ".join(a), "->", r.returncode, (r.stdout + r.stderr).strip()[:300])
-        return r.returncode
-    run("git", "config", "user.name", "node-bot")
-    run("git", "config", "user.email", "bot@localhost")
-    run("git", "add", "-A", "nodes.json", "top10.yaml")
-    if run("git", "commit", "-q", "-m", "auto update") != 0:
-        print("nothing to commit")
-    for i in range(3):
-        run("git", "pull", "--rebase", "--autostash", "-q", "origin", "main")
-        if run("git", "push", "-q", "origin", "HEAD:main") == 0:
-            print("pushed"); return
-        time.sleep(5)
-    print("push failed after retries")
+    for s in top:
+        print(" ", s["cc"], s["label"], f"{s['speed']}MB/s",
+              f"risk{s['risk']}%", f"score{s['score']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-    publish()
+    sys.exit(main())

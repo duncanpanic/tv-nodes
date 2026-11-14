@@ -112,13 +112,15 @@ jobs:
           print("nodes.json ok: top10=%d strict=%d scanned=%d" % (
               len(d["top10"]), d.get("strict_count", 0), d.get("source_count", 0)))
           PY
+          # all.yaml 是全量候选节点池，提交回仓库供国内网关拉取做直连过滤
+          cp output/all.yaml all.yaml
           git config user.name "node-bot"
           git config user.email "bot@localhost"
           for i in 1 2 3 4 5; do
             git fetch -q origin main
             # 把我们的数据变更重放到最新 origin/main 之上：永远不会产生 merge 冲突
             git reset -q --soft FETCH_HEAD
-            git add nodes.json top10.yaml
+            git add nodes.json top10.yaml all.yaml
             if git diff --cached --quiet; then
               echo "no change"
               exit 0

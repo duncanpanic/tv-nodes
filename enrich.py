@@ -268,8 +268,9 @@ def main():
     print(f"strict-encryption + geolocatable: {len(scored)}")
 
     timed = [s for s in scored if s["speed"] > 0]
-    print(f"with a measured speed this round: {len(timed)}")
-    pool = timed if timed else scored
+    fast = [s for s in timed if s["speed"] >= 0.5]
+    print(f"with a measured speed this round: {len(timed)} (>=0.5MB/s: {len(fast)})")
+    pool = fast or timed or scored
     if not pool:
         print("ERROR: no usable node after grading", file=sys.stderr)
         return 1
@@ -283,21 +284,21 @@ def main():
         s["score"] = round(0.70 * S + 0.30 * P, 1)
     pool.sort(key=lambda x: (-x["score"], -x["speed"]))
 
-    top, cc_n = [], collections.Counter()
-    for s in pool:
+    # 选 Top N：先按「同国家 ≤2」挑，挑不满再逐级放宽到 3、4、不限
+    top, picked = [], set()
+    for cap in (MAX_PER_CC, MAX_PER_CC + 1, MAX_PER_CC + 2, 10**6):
         if len(top) >= TOPN:
             break
-        if cc_n[s["cc"]] >= MAX_PER_CC:
-            continue
-        cc_n[s["cc"]] += 1
-        top.append(s)
-    if len(top) < TOPN:  # 多样性凑不满就按分数补齐
-        picked = {id(s) for s in top}
+        cc_n = collections.Counter(s["cc"] for s in top)
         for s in pool:
             if len(top) >= TOPN:
                 break
-            if id(s) not in picked:
-                top.append(s)
+            if id(s) in picked or cc_n[s["cc"]] >= cap:
+                continue
+            cc_n[s["cc"]] += 1
+            picked.add(id(s))
+            top.append(s)
+    top.sort(key=lambda x: (-x["score"], -x["speed"]))
 
     def pub(s):
         return {k: s.get(k) for k in

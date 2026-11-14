@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Parse subs-check output -> grade protocols -> score -> pick Top10.
+"""Parse subs-check output -> grade protocols -> score -> pick Top N.
 
 No per-node geo API calls: the country comes from the node name (subs-check
 renames every tested node to "🇩🇪DE_122|5.0MB/s|0%|YT-US|NF-HU") and is mapped
 to a built-in centroid for globe placement.
 
-Exit codes: 0 = nodes.json/top10.yaml written, 1 = nothing usable -> old data
+Scoring is speed-first: score = 0.70*speed + 0.30*purity(100-risk). The protocol
+grade stays a hard filter (weak / no-TLS protocols never reach scoring).
+
+Exit codes: 0 = nodes.json/top.yaml written, 1 = nothing usable -> old data
 files are left untouched so the published site keeps working.
 """
-import glob, json, math, re, sys, time, collections
+import glob, json, math, os, re, sys, time, collections
 
 OUT = "nodes.json"
-TOP = "top10.yaml"
+TOP = "top.yaml"
+TOPN = int(os.environ.get("TOPN", "20"))
+# 同一国家最多取几个（20 个节点要更宽的取样，避免全是一个机房）
+MAX_PER_CC = int(os.environ.get("MAX_PER_CC", "2"))
 
 WEAK_CIPHER = ("rc4", "table", "none", "des-cfb", "bf-cfb",
                "aes-128-cfb", "aes-256-cfb", "chacha20-ietf", "chacha20-poly1305")
@@ -273,17 +279,25 @@ def main():
         P = 100 - s["risk"]
         S = 100 * math.log1p(s["speed"]) / math.log1p(mx) if mx > 0 else 0
         s["P"], s["S"] = round(P, 1), round(S, 1)
-        s["score"] = round(0.35 * P + 0.25 * s["enc"] + 0.20 * S + 0.20 * min(100, S), 1)
+        # 速度优先（70%），纯净度/低风险次之（30%）
+        s["score"] = round(0.70 * S + 0.30 * P, 1)
     pool.sort(key=lambda x: (-x["score"], -x["speed"]))
 
     top, cc_n = [], collections.Counter()
     for s in pool:
-        if len(top) >= 10:
+        if len(top) >= TOPN:
             break
-        if cc_n[s["cc"]] >= 2:
+        if cc_n[s["cc"]] >= MAX_PER_CC:
             continue
         cc_n[s["cc"]] += 1
         top.append(s)
+    if len(top) < TOPN:  # 多样性凑不满就按分数补齐
+        picked = {id(s) for s in top}
+        for s in pool:
+            if len(top) >= TOPN:
+                break
+            if id(s) not in picked:
+                top.append(s)
 
     def pub(s):
         return {k: s.get(k) for k in
@@ -299,11 +313,13 @@ def main():
     dump_yaml({"proxies": out}, TOP)
     print(f"wrote {TOP} ({len(out)} nodes)")
 
+    items = [pub(s) for s in top]
     data = {"updated": int(time.time()), "source_count": len(proxies),
-            "strict_count": len(scored), "top10": [pub(s) for s in top]}
+            "strict_count": len(scored), "topn": len(items),
+            "top": items, "top10": items}   # top10 是旧字段别名，保持兼容
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"wrote {OUT} top10={len(top)}")
+    print(f"wrote {OUT} top={len(top)} (max {MAX_PER_CC}/country)")
     for s in top:
         print(" ", s["cc"], s["label"], f"{s['speed']}MB/s",
               f"risk{s['risk']}%", f"score{s['score']}")
